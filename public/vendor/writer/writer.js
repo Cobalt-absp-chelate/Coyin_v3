@@ -4,7 +4,7 @@
   var STORAGE_KEY = 'coyin-writing-content'
   var AI_STORAGE_KEY = 'coyin-ai-provider'
   var DEFAULT_CONTENT = [
-    '# 欢迎使用 知页 写作',
+    '# 欢迎使用 Coyin 写作',
     '',
     '开始你的写作之旅吧。',
     '',

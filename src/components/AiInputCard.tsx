@@ -4,7 +4,6 @@ import type { TodayPlan } from '../types/plan'
 import { loadConfig, saveConfig } from '../services/aiProvider'
 import { generatePlans } from '../services/planService'
 import { summarizeText, generateWriting, decomposeTask } from '../services/aiActions'
-import { callAI } from '../services/aiProvider'
 import { ModelSelector } from './ModelSelector'
 
 type SlashCommand = {
@@ -47,6 +46,7 @@ type AiInputCardProps = {
   onMemoAdd?: (text: string) => void
   onWriteDocSave?: (title: string, contentHtml: string, group?: string) => string | null
   onAddTaskPlans?: (tasks: TaskPlanItem[]) => TodayPlan[]
+  onChatMessage?: (text: string) => void
 }
 
 function extractTitleFromSummary(text: string): string {
@@ -109,7 +109,7 @@ function simpleMarkdownToHtml(md: string): string {
   return '<p>' + html + '</p>'
 }
 
-export function AiInputCard({ onPlanGenerated, onMemoAdd, onWriteDocSave, onAddTaskPlans }: AiInputCardProps) {
+export function AiInputCard({ onPlanGenerated, onMemoAdd, onWriteDocSave, onAddTaskPlans, onChatMessage }: AiInputCardProps) {
   const [input, setInput] = useState('')
   const [commandIndex, setCommandIndex] = useState(0)
   const [showCommands, setShowCommands] = useState(false)
@@ -320,25 +320,18 @@ export function AiInputCard({ onPlanGenerated, onMemoAdd, onWriteDocSave, onAddT
       return
     }
 
-    // ── No command match: generic AI chat ──
-    const chatInput = value
-    setInput('')
-    setGenerating(true)
-    setFeedback('')
-    try {
-      const cfg = loadConfig()
-      const result = await callAI(cfg, {
-        messages: [{ role: 'user', content: chatInput }],
-        maxTokens: 2048,
-      })
-      setFeedback(result.content)
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '请求失败'
-      setFeedback(msg)
-    } finally {
-      setGenerating(false)
+    // ── No command match: route to right-side chat panel ──
+    if (onChatMessage) {
+      setInput('')
+      onChatMessage(value)
+    } else {
+      // Fallback: if no chat panel available (shouldn't happen)
+      setInput('')
+      setFeedback('')
+      setFeedback('对话面板未就绪')
+      clearFeedback()
     }
-  }, [input, onPlanGenerated, onMemoAdd, onWriteDocSave, clearFeedback])
+  }, [input, onPlanGenerated, onMemoAdd, onWriteDocSave, onChatMessage, clearFeedback])
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

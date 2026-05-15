@@ -15,7 +15,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
-import './App.css'
+import './app.css'
 import { DayNightToggleGlass } from './components/DayNightToggleGlass'
 import { GlassSurface } from './components/GlassSurface'
 import { GlowParticles } from './components/GlowParticles'
@@ -23,6 +23,7 @@ import { AiInputCard } from './components/AiInputCard'
 import { AiProviderSettings } from './components/AiProviderSettings'
 import { TodayPlanOrbit } from './components/TodayPlanOrbit'
 import { FocusCapsule } from './components/FocusCapsule'
+import { ChatPanel } from './components/ChatPanel'
 
 import type { TodayPlan } from './types/plan'
 import type { ActiveFocusSession, FocusCategory } from './types/focus'
@@ -47,7 +48,9 @@ import { runMigrations, loadLibraryItems, saveLibraryItems, loadMemoItems, saveM
 import { importPdfFile, deleteStoredPdf, detectStorageBackend, downloadPaperViaTauri, importDownloadedPaper } from './services/documentStorageService'
 import type { DownloadPaperResult } from './services/documentStorageService'
 import { appFetch } from './services/httpClient'
-import { openUrl } from '@tauri-apps/plugin-opener'
+import type { ChatSession, ChatMessage } from './types/chat'
+import { streamChatCompletion, loadConfig } from './services/aiProvider'
+import { createSession, listSessions, getMessages, addMessage, deleteSession as deleteChatSession } from './services/chatStorageService'
 import {
   INITIAL_PAPER_RESULTS_PER_SOURCE,
   paperSources,
@@ -266,6 +269,13 @@ export function App() {
     return loadTodayPlans()
   })
   const [activeFocus, setActiveFocus] = useState<ActiveFocusSession | null>(() => loadActiveFocus())
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([])
+  const [activeChatSessionId, setActiveChatSessionId] = useState<string | null>(null)
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [isChatStreaming, setIsChatStreaming] = useState(false)
+  const [showChatPanel, setShowChatPanel] = useState(false)
+  const [isChatFullScreen, setIsChatFullScreen] = useState(false)
+  const [showSessionList, setShowSessionList] = useState(false)
 
   const searchTokenRef = useRef(0)
   const switchLibraryModeRef = useRef<(nextMode: LibraryMode, nextDocument?: PdfReaderDocument | null) => void>(undefined)
@@ -329,6 +339,154 @@ export function App() {
     return () => window.clearTimeout(timer)
   }, [libraryToast])
 
+  // Load chat sessions on mount
+  useEffect(() => {
+    listSessions().then(setChatSessions).catch(() => {})
+  }, [])
+
+  // ── Chat handlers ──
+
+  const handleChatMessage = useCallback(async (text: string) => {
+    try {
+      const config = loadConfig()
+      if (!config.baseUrl && !config.demoMode) {
+        setShowChatPanel(true)
+        const errorMsg: ChatMessage = {
+          id: `msg-error-${Date.now()}`,
+          session_id: activeChatSessionId || 'no-session',
+          role: 'assistant',
+          content: '未配置 AI 接口，请在设置中填写 Base URL 和 API Key，或开启 Demo 模式。',
+          thinking: null,
+          timestamp: Date.now(),
+        }
+        setChatMessages((prev) => [...prev, errorMsg])
+        return
+      }
+
+      setShowChatPanel(true)
+
+      let sessionId = activeChatSessionId
+      if (!sessionId) {
+        const session = await createSession(text.slice(0, 30) + (text.length > 30 ? '…' : ''))
+        sessionId = session.id
+        setActiveChatSessionId(sessionId)
+        setChatSessions((prev) => [session, ...prev])
+      }
+
+      const userMsg = await addMessage(sessionId, 'user', text)
+      setChatMessages((prev) => [...prev, userMsg])
+
+      setIsChatStreaming(true)
+
+      // Add placeholder assistant message before streaming
+      const placeholderId = `msg-${Date.now()}-assistant`
+      const placeholder: ChatMessage = {
+        id: placeholderId,
+        session_id: sessionId!,
+        role: 'assistant',
+        content: '',
+        thinking: null,
+        timestamp: Date.now(),
+      }
+      setChatMessages((prev) => [...prev, placeholder])
+
+      await streamChatCompletion(config, {
+        messages: [{ role: 'user', content: text }],
+        maxTokens: 2048,
+      }, {
+        onToken(token) {
+          setChatMessages((prev) => prev.map((m) =>
+            m.id === placeholderId ? { ...m, content: m.content + token } : m
+          ))
+        },
+        onThinking(thinkingToken) {
+          setChatMessages((prev) => prev.map((m) =>
+            m.id === placeholderId ? { ...m, thinking: (m.thinking || '') + thinkingToken } : m
+          ))
+        },
+        async onDone(fullContent, fullThinking) {
+          setIsChatStreaming(false)
+          if (fullContent || fullThinking) {
+            const aiMsg = await addMessage(sessionId!, 'assistant', fullContent, fullThinking || null)
+            setChatMessages((prev) => prev.map((m) =>
+              m.id === placeholderId ? aiMsg : m
+            ))
+          } else {
+            setChatMessages((prev) => prev.filter((m) => m.id !== placeholderId))
+          }
+        },
+        onError(error) {
+          setIsChatStreaming(false)
+          setChatMessages((prev) => prev.map((m) =>
+            m.id === placeholderId
+              ? { ...m, content: `错误: ${error}` }
+              : m
+          ))
+        },
+      })
+    } catch (err) {
+      setIsChatStreaming(false)
+      const errorMsg: ChatMessage = {
+        id: `msg-error-${Date.now()}`,
+        session_id: activeChatSessionId || 'no-session',
+        role: 'assistant',
+        content: `系统错误: ${err instanceof Error ? err.message : String(err)}`,
+        thinking: null,
+        timestamp: Date.now(),
+      }
+      setChatMessages((prev) => [...prev, errorMsg])
+      setShowChatPanel(true)
+    }
+  }, [activeChatSessionId])
+
+  const handleSelectSession = useCallback(async (sessionId: string) => {
+    setActiveChatSessionId(sessionId)
+    const msgs = await getMessages(sessionId)
+    setChatMessages(msgs)
+    setShowChatPanel(true)
+  }, [])
+
+  const handleDeleteSession = useCallback(async (sessionId: string) => {
+    await deleteChatSession(sessionId)
+    setChatSessions((prev) => prev.filter((s) => s.id !== sessionId))
+    if (activeChatSessionId === sessionId) {
+      const remaining = chatSessions.filter((s) => s.id !== sessionId)
+      const next = remaining[0]
+      if (next) {
+        setActiveChatSessionId(next.id)
+        const msgs = await getMessages(next.id)
+        setChatMessages(msgs)
+      } else {
+        setActiveChatSessionId(null)
+        setChatMessages([])
+        setShowChatPanel(false)
+      }
+    }
+  }, [activeChatSessionId, chatSessions])
+
+  const handleNewSession = useCallback(() => {
+    setActiveChatSessionId(null)
+    setChatMessages([])
+    setShowChatPanel(true)
+    setShowSessionList(false)
+  }, [])
+
+  const handleToggleFullScreen = useCallback(() => {
+    setIsChatFullScreen((prev) => !prev)
+  }, [])
+
+  const handleCloseFullScreen = useCallback(() => {
+    setIsChatFullScreen(false)
+  }, [])
+
+  const handleToggleSessionList = useCallback(() => {
+    setShowSessionList((prev) => !prev)
+  }, [])
+
+  const handleCloseSessionList = useCallback(() => {
+    setShowSessionList(false)
+  }, [])
+
   const switchPage = (nextPage: Page) => {
     if (nextPage === activePage) {
       return
@@ -350,8 +508,9 @@ export function App() {
     })
   }
 
-  const openExternalUrl = useCallback((url: string) => {
+  const openExternalUrl = useCallback(async (url: string) => {
     try {
+      const { openUrl } = await import('@tauri-apps/plugin-opener')
       void openUrl(url)
     } catch {
       window.open(url, '_blank', 'noopener,noreferrer')
@@ -1159,6 +1318,22 @@ export function App() {
                 onMemoAddFromCommand={handleMemoAdd}
                 onWriteDocSave={handleWriteDocSave}
                 onAddTaskPlans={handleAddTaskPlans}
+                onChatMessage={handleChatMessage}
+                chatSessions={chatSessions}
+                activeChatSessionId={activeChatSessionId}
+                chatMessages={chatMessages}
+                isChatStreaming={isChatStreaming}
+                showChatPanel={showChatPanel}
+                isChatFullScreen={isChatFullScreen}
+                showChatSessionList={showSessionList}
+                onChatSend={handleChatMessage}
+                onChatSelectSession={handleSelectSession}
+                onChatDeleteSession={handleDeleteSession}
+                onChatToggleFullScreen={handleToggleFullScreen}
+                onChatCloseFullScreen={handleCloseFullScreen}
+                onChatToggleSessionList={handleToggleSessionList}
+                onChatCloseSessionList={handleCloseSessionList}
+                onChatNewSession={handleNewSession}
                 theme={theme}
               />
             ) : null}
@@ -1282,6 +1457,22 @@ function WorkbenchPage({
   onMemoAddFromCommand,
   onWriteDocSave,
   onAddTaskPlans,
+  onChatMessage,
+  chatSessions,
+  activeChatSessionId,
+  chatMessages,
+  isChatStreaming,
+  showChatPanel,
+  isChatFullScreen,
+  showChatSessionList,
+  onChatSend,
+  onChatSelectSession,
+  onChatDeleteSession,
+  onChatToggleFullScreen,
+  onChatCloseFullScreen,
+  onChatToggleSessionList,
+  onChatCloseSessionList,
+  onChatNewSession,
   theme,
 }: {
   mode: WorkbenchMode
@@ -1318,6 +1509,22 @@ function WorkbenchPage({
   onMemoAddFromCommand: (text: string) => void
   onWriteDocSave: (title: string, contentHtml: string, group?: string) => string | null
   onAddTaskPlans: (tasks: Array<{ title: string; description: string; priority: string; time: string }>) => TodayPlan[]
+  onChatMessage: (text: string) => void
+  chatSessions: ChatSession[]
+  activeChatSessionId: string | null
+  chatMessages: ChatMessage[]
+  isChatStreaming: boolean
+  showChatPanel: boolean
+  isChatFullScreen: boolean
+  showChatSessionList: boolean
+  onChatSend: (text: string) => void
+  onChatSelectSession: (sessionId: string) => void
+  onChatDeleteSession: (sessionId: string) => void
+  onChatToggleFullScreen: () => void
+  onChatCloseFullScreen: () => void
+  onChatToggleSessionList: () => void
+  onChatCloseSessionList: () => void
+  onChatNewSession: () => void
   theme: Theme
 }) {
   const showResume = mode === 'console' && Boolean(lastSearchQuery)
@@ -1373,6 +1580,7 @@ function WorkbenchPage({
                 onMemoAdd={onMemoAddFromCommand}
                 onWriteDocSave={onWriteDocSave}
                 onAddTaskPlans={onAddTaskPlans}
+                onChatMessage={onChatMessage}
               />
 
             {/* ── Today plan orbit ── */}
@@ -1587,6 +1795,24 @@ function WorkbenchPage({
       {/* ── Inspiration side panel ── */}
       <aside className="inspiration-side page-secondary">
         <InspirationPanel inspirations={inspirations} />
+        <ChatPanel
+          sessions={chatSessions}
+          activeSessionId={activeChatSessionId}
+          messages={chatMessages}
+          isStreaming={isChatStreaming}
+          visible={showChatPanel}
+          isFullScreen={isChatFullScreen}
+          showSessionList={showChatSessionList}
+          theme={theme}
+          onSend={onChatSend}
+          onSelectSession={onChatSelectSession}
+          onDeleteSession={onChatDeleteSession}
+          onToggleFullScreen={onChatToggleFullScreen}
+          onCloseFullScreen={onChatCloseFullScreen}
+          onToggleSessionList={onChatToggleSessionList}
+          onCloseSessionList={onChatCloseSessionList}
+          onNewSession={onChatNewSession}
+        />
       </aside>
     </section>
   )

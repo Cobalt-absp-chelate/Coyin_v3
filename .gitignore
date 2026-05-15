@@ -11,13 +11,9 @@ node_modules
 dist
 dist-ssr
 *.local
-src-tauri/target
-.claude
-vite-dev.log
-vite-dev.err.log
-src-tauri/tauri.conf.json.bak-beforeBuildCommand
-release
-*.tmp
+
+src-tauri/target/
+src-tauri/gen/
 
 # Editor directories and files
 .vscode/*

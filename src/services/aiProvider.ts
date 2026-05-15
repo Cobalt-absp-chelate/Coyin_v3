@@ -290,6 +290,183 @@ async function callAnthropic(
   }
 }
 
+// ── streaming ──
+
+export type StreamCallbacks = {
+  onToken: (token: string) => void
+  onThinking: (thinkingToken: string) => void
+  onDone: (fullContent: string, fullThinking: string) => void
+  onError: (error: string) => void
+}
+
+export async function streamChatCompletion(
+  config: AiProviderConfig,
+  options: AiCallOptions,
+  callbacks: StreamCallbacks,
+): Promise<void> {
+  if (config.demoMode) {
+    const demoText = '这是一条来自 Demo 模式的模拟流式回复。关闭 Demo 模式后，将调用真实 AI 接口获得流式响应。'
+    for (let i = 0; i < demoText.length; i++) {
+      await new Promise((r) => setTimeout(r, 40))
+      callbacks.onToken(demoText[i])
+    }
+    callbacks.onDone(demoText, '')
+    return
+  }
+
+  if (!config.baseUrl) {
+    callbacks.onError('未配置 Base URL')
+    return
+  }
+
+  const model = options.model || config.currentModel || config.manualModel
+  if (!model) {
+    callbacks.onError('未选择或输入模型')
+    return
+  }
+
+  if (config.protocol === 'anthropic') {
+    // Fallback: Anthropic streaming uses SSE with different format
+    // For now, fall back to non-streaming
+    try {
+      const result = await callAI(config, options)
+      for (let i = 0; i < result.content.length; i++) {
+        await new Promise((r) => setTimeout(r, 15))
+        callbacks.onToken(result.content[i])
+      }
+      callbacks.onDone(result.content, '')
+    } catch (err) {
+      callbacks.onError(err instanceof Error ? err.message : '请求失败')
+    }
+    return
+  }
+
+  await streamOpenAI(config, model, options, callbacks)
+}
+
+async function streamOpenAI(
+  config: AiProviderConfig,
+  model: string,
+  options: AiCallOptions,
+  callbacks: StreamCallbacks,
+): Promise<void> {
+  const url = buildApiUrl(config.baseUrl, config.chatPath)
+  const body = {
+    model,
+    messages: options.messages,
+    temperature: options.temperature ?? 0.7,
+    max_tokens: options.maxTokens ?? 2048,
+    stream: true,
+  }
+
+  let res: Response
+  try {
+    res = await appFetch(url, {
+      method: 'POST',
+      headers: buildHeaders(config),
+      body: JSON.stringify(body),
+    })
+  } catch (err) {
+    callbacks.onError(err instanceof Error ? err.message : '网络请求失败')
+    return
+  }
+
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '')
+    callbacks.onError(parseErrorMessage(res.status, errBody))
+    return
+  }
+
+  const reader = res.body?.getReader()
+  if (!reader) {
+    callbacks.onError('响应体不可读')
+    return
+  }
+
+  const decoder = new TextDecoder()
+  let fullContent = ''
+  let fullThinking = ''
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed || trimmed === 'data: [DONE]') continue
+        if (!trimmed.startsWith('data: ')) continue
+
+        const jsonStr = trimmed.slice(6)
+        try {
+          const data = JSON.parse(jsonStr)
+          const choice = data?.choices?.[0]
+          if (!choice) continue
+
+          const delta = choice.delta
+
+          // reasoning_content (DeepSeek style)
+          if (delta?.reasoning_content) {
+            fullThinking += delta.reasoning_content
+            callbacks.onThinking(delta.reasoning_content)
+          }
+
+          // content
+          if (delta?.content) {
+            fullContent += delta.content
+            callbacks.onToken(delta.content)
+          }
+        } catch {
+          // skip unparseable chunks
+        }
+      }
+    }
+
+    // Process remaining buffer
+    if (buffer.trim()) {
+      const trimmed = buffer.trim()
+      if (trimmed.startsWith('data: ') && trimmed !== 'data: [DONE]') {
+        try {
+          const data = JSON.parse(trimmed.slice(6))
+          const delta = data?.choices?.[0]?.delta
+          if (delta?.content) fullContent += delta.content
+          if (delta?.reasoning_content) fullThinking += delta.reasoning_content
+        } catch { /* skip */ }
+      }
+    }
+
+    // Fallback: if no streaming content, the API may not support SSE and
+    // returned a regular JSON response. Try to parse it.
+    if (!fullContent && !fullThinking) {
+      try {
+        const data = JSON.parse(buffer)
+        const content = data?.choices?.[0]?.message?.content
+        if (typeof content === 'string') {
+          fullContent = content
+          // Simulate typing for the non-streaming fallback
+          for (let i = 0; i < content.length; i++) {
+            callbacks.onToken(content[i])
+            await new Promise((r) => setTimeout(r, 10))
+          }
+        }
+      } catch { /* not JSON or unexpected format */ }
+    }
+
+    callbacks.onDone(fullContent, fullThinking)
+  } catch (err) {
+    if (fullContent) {
+      callbacks.onDone(fullContent, fullThinking)
+    } else {
+      callbacks.onError(err instanceof Error ? err.message : '流式读取中断')
+    }
+  }
+}
+
 // ── test connection ──
 
 export type TestResult = {
