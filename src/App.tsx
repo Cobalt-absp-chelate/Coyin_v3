@@ -24,6 +24,21 @@ import { AiProviderSettings } from './components/AiProviderSettings'
 import { TodayPlanOrbit } from './components/TodayPlanOrbit'
 import { FocusCapsule } from './components/FocusCapsule'
 import { ChatPanel } from './components/ChatPanel'
+import { PetOrb } from './components/PetOrb'
+import { PetInfoPanel } from './components/PetInfoPanel'
+import { PetSettingsCard } from './components/PetSettingsCard'
+import { HomeInfoPanel } from './components/HomeInfoPanel'
+import { HomeLayoutEditor } from './components/HomeLayoutEditor'
+import { PetChatDialog } from './components/PetChatDialog'
+import { showPetContextMenu } from './components/PetContextMenu'
+import {
+  loadPetSettings,
+  loadHomeLayout,
+  saveHomeLayout,
+  pickSpeechLine,
+} from './services/petStorageService'
+import { generatePetSpeech, type PetContext } from './services/petAiService'
+import type { PetSettings, HomeLayout } from './types/pet'
 
 import type { TodayPlan } from './types/plan'
 import type { ActiveFocusSession, FocusCategory } from './types/focus'
@@ -276,6 +291,152 @@ export function App() {
   const [showChatPanel, setShowChatPanel] = useState(false)
   const [isChatFullScreen, setIsChatFullScreen] = useState(false)
   const [showSessionList, setShowSessionList] = useState(false)
+
+  // ── Pet state ──
+  const [petSettings, setPetSettings] = useState<PetSettings>(() => loadPetSettings())
+
+  // Sync pet settings from PetSettingsCard changes
+  useEffect(() => {
+    const handler = () => setPetSettings(loadPetSettings())
+    window.addEventListener('pet-settings-changed', handler)
+    return () => window.removeEventListener('pet-settings-changed', handler)
+  }, [])
+
+  // Handle navigation from pet info panel
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { page } = (e as CustomEvent).detail
+      if (page === 'library') setActivePage('library')
+      else if (page === 'writing') setActivePage('writing')
+      else if (page === 'workbench') setActivePage('workbench')
+    }
+    window.addEventListener('pet-nav-to', handler)
+    return () => window.removeEventListener('pet-nav-to', handler)
+  }, [])
+  const [homeLayout, setHomeLayout] = useState<HomeLayout>(() => loadHomeLayout())
+  const [layoutEditing, setLayoutEditing] = useState(false)
+  const [showPetInfo, setShowPetInfo] = useState(false)
+  const [showPetChat, setShowPetChat] = useState(false)
+  const [petSpeechLine, setPetSpeechLine] = useState<string | null>(null)
+  const [showPetSpeech, setShowPetSpeech] = useState(false)
+  const [petMuted, setPetMuted] = useState(false)
+  const petContainerRef = useRef<HTMLDivElement>(null)
+  const speechTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const speechStoppedRef = useRef(false)
+  const sessionStartRef = useRef(Date.now());
+  (globalThis as Record<string, unknown>).__sessionStart = sessionStartRef.current
+
+  // ── Pet speech timer ──
+  useEffect(() => {
+    const clearTimer = () => {
+      if (speechTimerRef.current) {
+        clearTimeout(speechTimerRef.current)
+        speechTimerRef.current = null
+      }
+    }
+    clearTimer()
+    speechStoppedRef.current = false
+
+    if (!petSettings.enabled || !petSettings.allowSpeech || petSettings.speakFrequency === 'silent' || petMuted) {
+      return
+    }
+
+    // ── Non-AI mode: fixed interval ──
+    if (!petSettings.aiSpeechEnabled) {
+      const intervals: Record<string, number> = {
+        rare: 45000,
+        moderate: 25000,
+      }
+      const interval = intervals[petSettings.speakFrequency] || 60000
+
+      const tick = () => {
+        const line = pickSpeechLine(petSettings.userName, petSettings.customLines, Math.round((Date.now() - sessionStartRef.current) / 60000))
+        setPetSpeechLine(line)
+        setShowPetSpeech(true)
+        setTimeout(() => setShowPetSpeech(false), 6000)
+      }
+
+      // Use setInterval but track with a setTimeout-like ref
+      const id = setInterval(tick, interval)
+      speechTimerRef.current = id as unknown as ReturnType<typeof setTimeout>
+      return () => clearInterval(id)
+    }
+
+    // ── AI mode: distribute speeches randomly within the window ──
+    const avgInterval = (petSettings.aiSpeechWindow * 60000) / petSettings.aiSpeechCount
+
+    const scheduleNext = () => {
+      if (speechStoppedRef.current) return
+      const jitter = 0.5 + Math.random()
+      const delay = Math.max(15000, avgInterval * jitter)
+
+      speechTimerRef.current = setTimeout(async () => {
+        if (speechStoppedRef.current) return
+        const ctx: PetContext = {
+          userName: petSettings.userName,
+          currentPage: activePage,
+          timeOfDay: getTimeOfDay(),
+          sessionMinutes: Math.round((Date.now() - sessionStartRef.current) / 60000),
+        }
+        const aiLine = await generatePetSpeech(ctx)
+        if (aiLine) {
+          setPetSpeechLine(aiLine)
+          setShowPetSpeech(true)
+          setTimeout(() => setShowPetSpeech(false), 7000)
+        } else {
+          const line = pickSpeechLine(petSettings.userName, petSettings.customLines, Math.round((Date.now() - sessionStartRef.current) / 60000))
+          setPetSpeechLine(line)
+          setShowPetSpeech(true)
+          setTimeout(() => setShowPetSpeech(false), 6000)
+        }
+        scheduleNext()
+      }, delay)
+    }
+
+    scheduleNext()
+    return () => { speechStoppedRef.current = true; clearTimer() }
+  }, [petSettings.enabled, petSettings.allowSpeech, petSettings.speakFrequency, petSettings.userName, petSettings.customLines, petMuted, petSettings.aiSpeechEnabled, petSettings.aiSpeechWindow, petSettings.aiSpeechCount, activePage])
+
+  const handlePetContextMenu = useCallback((x: number, y: number, paused: boolean) => {
+    showPetContextMenu(x, y, paused, petMuted)
+  }, [petMuted])
+
+  const handleToggleMute = useCallback(() => {
+    setPetMuted((prev) => !prev)
+  }, [])
+
+  const handlePetSpeak = useCallback(() => {
+    const line = pickSpeechLine(petSettings.userName, petSettings.customLines, Math.round((Date.now() - sessionStartRef.current) / 60000))
+    setPetSpeechLine(line)
+    setShowPetSpeech(true)
+    setTimeout(() => setShowPetSpeech(false), 6000)
+  }, [petSettings.userName, petSettings.customLines])
+
+  const handlePetClick = useCallback(() => {
+    setShowPetInfo(true)
+  }, [])
+
+  const handlePetChat = useCallback(() => {
+    setShowPetChat(true)
+  }, [])
+
+  const handleEnterLayoutEdit = useCallback(() => {
+    setLayoutEditing(true)
+    setActivePage('workbench')
+    if (workbenchMode !== 'console') {
+      setWorkbenchMode('console')
+    }
+  }, [workbenchMode])
+
+  const handleSaveLayout = useCallback((layout: HomeLayout) => {
+    setHomeLayout(layout)
+    saveHomeLayout(layout)
+    setLayoutEditing(false)
+  }, [])
+
+  const handleCancelLayout = useCallback(() => {
+    setLayoutEditing(false)
+  }, [])
 
   const searchTokenRef = useRef(0)
   const switchLibraryModeRef = useRef<(nextMode: LibraryMode, nextDocument?: PdfReaderDocument | null) => void>(undefined)
@@ -1158,29 +1319,26 @@ export function App() {
   }, [])
 
   const handlePlanGenerated = (newPlans: TodayPlan[]): number => {
-    let addedCount = 0
-    setTodayPlans((existing) => {
-      const maxId = existing.reduce((max, p) => {
-        const n = parseInt(p.id.replace('plan-', ''), 10)
-        return Number.isNaN(n) ? max : Math.max(max, n)
-      }, 0)
+    const existing = loadTodayPlans()
+    const maxId = existing.reduce((max, p) => {
+      const n = parseInt(p.id.replace('plan-', ''), 10)
+      return Number.isNaN(n) ? max : Math.max(max, n)
+    }, 0)
 
-      let nextId = maxId + 1
-      const toAdd: TodayPlan[] = []
-      for (const p of newPlans) {
-        if (isDuplicatePlan(existing, p)) continue
-        toAdd.push({ ...p, id: `plan-${nextId}` })
-        nextId++
-      }
+    let nextId = maxId + 1
+    const toAdd: TodayPlan[] = []
+    for (const p of newPlans) {
+      if (isDuplicatePlan(existing, p)) continue
+      toAdd.push({ ...p, id: `plan-${nextId}` })
+      nextId++
+    }
 
-      addedCount = toAdd.length
-      if (toAdd.length === 0) return existing
-
+    if (toAdd.length > 0) {
       const merged = [...existing, ...toAdd]
+      setTodayPlans(merged)
       saveTodayPlans(merged)
-      return merged
-    })
-    return addedCount
+    }
+    return toAdd.length
   }
 
   const handlePlanStart = (planId: string) => {
@@ -1272,7 +1430,7 @@ export function App() {
           </nav>
         </aside>
 
-        <main className="main-area">
+        <main className="main-area" ref={petContainerRef}>
           <header className="topbar topbar-compact">
             <div className="tool-strip">
               <TopTool icon={Import} label="导入" theme={theme} onClick={() => void handleImportFile()} />
@@ -1283,6 +1441,14 @@ export function App() {
 
           <div className="page-stage">
             {activePage === 'workbench' ? (
+              layoutEditing ? (
+                <HomeLayoutEditor
+                  layout={homeLayout}
+                  onSave={handleSaveLayout}
+                  onCancel={handleCancelLayout}
+                  theme={theme}
+                />
+              ) : (
               <WorkbenchPage
                 mode={workbenchMode}
                 searchQuery={searchQuery}
@@ -1335,7 +1501,10 @@ export function App() {
                 onChatCloseSessionList={handleCloseSessionList}
                 onChatNewSession={handleNewSession}
                 theme={theme}
+                showInfoPanel={!petSettings.enabled}
+                homeLayout={homeLayout}
               />
+              )
             ) : null}
             {activePage === 'library' ? (
               libraryMode === 'reader' && readerDocument ? (
@@ -1388,9 +1557,47 @@ export function App() {
                 </>
               )
             ) : null}
-            {activePage === 'settings' ? <SettingsPage theme={theme} /> : null}
+            {activePage === 'settings' ? (
+              <SettingsPage
+                theme={theme}
+                onEnterLayoutEdit={handleEnterLayoutEdit}
+              />
+            ) : null}
             {activePage === 'writing' ? <WritingModule theme={theme} onBack={() => switchPage('workbench')} /> : null}
           </div>
+
+          {/* ── Pet Orb (visible on all pages when enabled) ── */}
+          {petSettings.enabled && (
+            <PetOrb
+              settings={petSettings}
+              containerRef={petContainerRef}
+              onContextMenu={(x, y, paused) => handlePetContextMenu(x, y, paused)}
+              onClickOrb={handlePetClick}
+              onSpeak={handlePetSpeak}
+              onToggleMute={handleToggleMute}
+              onChat={handlePetChat}
+              speechLine={petSpeechLine}
+              showSpeech={showPetSpeech}
+            />
+          )}
+
+          {/* ── Pet Info Panel Overlay ── */}
+          {showPetInfo && (
+            <PetInfoPanel
+              theme={theme}
+              onClose={() => setShowPetInfo(false)}
+            />
+          )}
+
+          {/* ── Pet Chat Dialog ── */}
+          {showPetChat && (
+            <PetChatDialog
+              userName={petSettings.userName}
+              currentPage={activePage}
+              theme={theme}
+              onClose={() => setShowPetChat(false)}
+            />
+          )}
         </main>
       </div>
 
@@ -1474,6 +1681,8 @@ function WorkbenchPage({
   onChatCloseSessionList,
   onChatNewSession,
   theme,
+  showInfoPanel,
+  homeLayout,
 }: {
   mode: WorkbenchMode
   searchQuery: string
@@ -1526,6 +1735,8 @@ function WorkbenchPage({
   onChatCloseSessionList: () => void
   onChatNewSession: () => void
   theme: Theme
+  showInfoPanel: boolean
+  homeLayout: HomeLayout
 }) {
   const showResume = mode === 'console' && Boolean(lastSearchQuery)
 
@@ -1574,79 +1785,91 @@ function WorkbenchPage({
 
         {mode === 'console' ? (
           <div className="workbench-console">
-            {/* ── AI Input Card ── */}
-            <AiInputCard
-                onPlanGenerated={onPlanGenerated}
-                onMemoAdd={onMemoAddFromCommand}
-                onWriteDocSave={onWriteDocSave}
-                onAddTaskPlans={onAddTaskPlans}
-                onChatMessage={onChatMessage}
-              />
-
-            {/* ── Today plan orbit ── */}
-            {todayPlans.length > 0 ? (
-              <TodayPlanOrbit
-                plans={todayPlans}
-                onStart={onPlanStart}
-                onComplete={onPlanComplete}
-                onUncomplete={onPlanUncomplete}
-                onDelete={onPlanDelete}
-              />
-            ) : (
-              <div className="today-plan-empty">
-                <span className="today-plan-empty-hint">输入 <kbd>/plan</kbd> 创建今日计划</span>
-              </div>
-            )}
-
-            {/* ── Existing cards ── */}
             <div className="console-grid">
-              <article className="content-panel console-card memo-card">
-                <span className="eyebrow">备忘</span>
-                <div className="memo-compose">
-                  <input
-                    aria-label="新增待办"
-                    value={memoDraft}
-                    placeholder="添加待办事项"
-                    onChange={(event) => onMemoDraftChange(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') onAddMemo()
-                    }}
-                  />
-                  <button type="button" className="memo-add-button" onClick={onAddMemo}>
-                    添加
-                  </button>
-                </div>
-                <div className="memo-list" role="list">
-                  {memoItems.map((item) => (
-                    <div
-                      key={item.id}
-                      className={`memo-item ${item.completing ? 'is-completing' : ''} ${item.entering ? 'is-entering' : ''}`}
-                      role="listitem"
-                    >
-                      <button
-                        type="button"
-                        className={`memo-toggle ${item.completing ? 'is-checked' : ''}`}
-                        aria-label={`完成 ${item.text}`}
-                        onClick={() => onCompleteMemo(item.id)}
-                        disabled={item.completing}
-                      >
-                        {item.completing ? (
-                          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z" /></svg>
-                        ) : (
-                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" /></svg>
-                        )}
-                      </button>
-                      <span className="memo-text">{item.text}</span>
-                      {item.completing ? (
-                        <span className="memo-burst" aria-hidden="true">
-                          <span /><span /><span /><span /><span /><span />
-                          <span /><span /><span /><span /><span /><span />
-                        </span>
-                      ) : null}
-                    </div>
-                  ))}
-                </div>
-              </article>
+              {homeLayout.order.map((cardId) => {
+                switch (cardId) {
+                  case 'ai-input':
+                    return (
+                      <AiInputCard
+                        key="ai-input"
+                        onPlanGenerated={onPlanGenerated}
+                        onMemoAdd={onMemoAddFromCommand}
+                        onWriteDocSave={onWriteDocSave}
+                        onAddTaskPlans={onAddTaskPlans}
+                        onChatMessage={onChatMessage}
+                      />
+                    )
+                  case 'today-plan':
+                    return todayPlans.length > 0 ? (
+                      <TodayPlanOrbit
+                        key="today-plan"
+                        plans={todayPlans}
+                        onStart={onPlanStart}
+                        onComplete={onPlanComplete}
+                        onUncomplete={onPlanUncomplete}
+                        onDelete={onPlanDelete}
+                      />
+                    ) : (
+                      <div key="today-plan" className="today-plan-empty">
+                        <span className="today-plan-empty-hint">输入 <kbd>/plan</kbd> 创建今日计划</span>
+                      </div>
+                    )
+                  case 'memo-card':
+                    return (
+                      <article key="memo-card" className="content-panel console-card memo-card">
+                        <span className="eyebrow">备忘</span>
+                        <div className="memo-compose">
+                          <input
+                            aria-label="新增待办"
+                            value={memoDraft}
+                            placeholder="添加待办事项"
+                            onChange={(event) => onMemoDraftChange(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter') onAddMemo()
+                            }}
+                          />
+                          <button type="button" className="memo-add-button" onClick={onAddMemo}>
+                            添加
+                          </button>
+                        </div>
+                        <div className="memo-list" role="list">
+                          {memoItems.map((item) => (
+                            <div
+                              key={item.id}
+                              className={`memo-item ${item.completing ? 'is-completing' : ''} ${item.entering ? 'is-entering' : ''}`}
+                              role="listitem"
+                            >
+                              <button
+                                type="button"
+                                className={`memo-toggle ${item.completing ? 'is-checked' : ''}`}
+                                aria-label={`完成 ${item.text}`}
+                                onClick={() => onCompleteMemo(item.id)}
+                                disabled={item.completing}
+                              >
+                                {item.completing ? (
+                                  <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z" /></svg>
+                                ) : (
+                                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" /></svg>
+                                )}
+                              </button>
+                              <span className="memo-text">{item.text}</span>
+                              {item.completing ? (
+                                <span className="memo-burst" aria-hidden="true">
+                                  <span /><span /><span /><span /><span /><span />
+                                  <span /><span /><span /><span /><span /><span />
+                                </span>
+                              ) : null}
+                            </div>
+                          ))}
+                        </div>
+                      </article>
+                    )
+                  case 'info-panel':
+                    return <HomeInfoPanel key="info-panel" visible={showInfoPanel} theme={theme} />
+                  default:
+                    return null
+                }
+              })}
             </div>
           </div>
         ) : (
@@ -1966,7 +2189,7 @@ function LibraryPage({
   )
 }
 
-function SettingsPage({ theme }: { theme: Theme }) {
+function SettingsPage({ theme, onEnterLayoutEdit }: { theme: Theme; onEnterLayoutEdit: () => void }) {
   return (
     <section className="settings-page page-primary">
       {settingsSections.map((section) => (
@@ -1988,6 +2211,40 @@ function SettingsPage({ theme }: { theme: Theme }) {
         </article>
       ))}
       <AiProviderSettings />
+      <PetSettingsCard />
+      {/* ── Layout editor - standalone card ── */}
+      <article className="content-panel pet-settings-card">
+        <div className="pet-settings-header">
+          <div className="setting-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <rect x="3" y="3" width="7" height="7" rx="1" />
+              <rect x="14" y="3" width="7" height="7" rx="1" />
+              <rect x="3" y="14" width="7" height="7" rx="1" />
+              <rect x="14" y="14" width="7" height="7" rx="1" />
+            </svg>
+          </div>
+          <div>
+            <h2>主页布局</h2>
+            <p>调整工作台卡片排列顺序</p>
+          </div>
+        </div>
+        <button
+          className="ai-btn pet-layout-edit-btn"
+          onClick={onEnterLayoutEdit}
+        >
+          进入布局编辑模式
+        </button>
+      </article>
     </section>
   )
+}
+
+function getTimeOfDay(): string {
+  const h = new Date().getHours()
+  if (h >= 5 && h < 8) return '清晨'
+  if (h >= 8 && h < 12) return '上午'
+  if (h >= 12 && h < 14) return '中午'
+  if (h >= 14 && h < 18) return '下午'
+  if (h >= 18 && h < 22) return '晚上'
+  return '深夜'
 }

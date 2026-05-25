@@ -79,8 +79,14 @@ export function WritingModule({ theme, onBack }: { theme: Theme; onBack: () => v
   }, [activeDocId])
 
   const handleBackFromEditor = useCallback(() => {
-    setShowRename(true)
-  }, [])
+    if (activeDoc?.title) {
+      setActiveDocId(null)
+      saveActiveDocId(null)
+      setView('library')
+    } else {
+      setShowRename(true)
+    }
+  }, [activeDoc])
 
   // ── Rename dialog ──
 
